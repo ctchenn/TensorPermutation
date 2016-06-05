@@ -157,48 +157,46 @@ __global__ void transposeInplace(float *odata, const float *idata, const int* si
 {
   __shared__ float tile[TILE_DIM][TILE_DIM];
 
-  int idx1 = threadIdx.x;
-  int idx2 = threadIdx.y;
-  int idx3 = threadIdx.z;
-  int pos1 = blockIdx.x * TILE_DIM + idx1;  // transpose block offset
-  int pos2 = blockIdx.y * TILE_DIM + idx2;
-  int pos3 = blockIdx.z * 1 + idx3;   
-  int postpos1 = blockIdx.y * TILE_DIM + idx1;
-  int postpos2 = blockIdx.x * TILE_DIM + idx2;
+  int idx0 = threadIdx.x;
+  int idx1 = threadIdx.y;
+  int idx2 = threadIdx.z;
+  int pos0 = blockIdx.x * TILE_DIM + idx0;  // transpose block offset
+  int pos1 = blockIdx.y * TILE_DIM + idx1;
+  int pos2 = blockIdx.z * 1 + idx2;   
+  int postpos0 = blockIdx.y * TILE_DIM + idx0;
+  int postpos1 = blockIdx.x * TILE_DIM + idx1;
   assert(threadIdx.z==0);
   const int nx = sizes[0];
   const int ny = sizes[1];
   const int nz = sizes[2];
 
-  // idx1 --> z, idx2 --> y, idx3 --> x 
+  // idx0 --> z, idx1 --> y, idx2 --> x 
   if (perm[0] == 1 and perm[1] == 2) {  // exchange j, k
       for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS)
-          tile[idx2+j][(idx1+idx2+j)%TILE_DIM] = 
-              idata[pos3*ny*nz + (pos2+j)*nz + pos1];
+          tile[idx1+j][(idx0+idx1+j)%TILE_DIM] = 
+              idata[pos2*ny*nz + (pos1+j)*nz + pos0];
       __syncthreads();
       for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS)
-          odata[pos3*nz*ny + (postpos2+j)*ny + postpos1] = 
-              tile[idx1][(idx2+j+idx1)%TILE_DIM];
+          odata[pos2*nz*ny + (postpos1+j)*ny + postpos0] = 
+              tile[idx0][(idx1+j+idx0)%TILE_DIM];
   }
 
-  // idx1: z, idx2: x, idx3: y
+  // idx0: z, idx1: x, idx2: y
   if (perm[0] == 0 and perm[1] == 2) {  // i, k
       for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS)
-          tile[idx2+j][(idx1+idx2+j)%TILE_DIM] = 
-              idata[(pos2+j)*ny*nz + pos3*nz + pos1];
+          tile[idx1+j][(idx0+idx1+j)%TILE_DIM] = 
+              idata[(pos1+j)*ny*nz + pos2*nz + pos0];
       __syncthreads();
       for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS)
-          odata[(postpos2+j)*ny*nx + pos3*nx + postpos1] = 
-              tile[idx1][(idx2+j+idx1)%TILE_DIM];
+          odata[(postpos1+j)*ny*nx + pos2*nx + postpos0] = 
+              tile[idx0][(idx1+j+idx0)%TILE_DIM];
   }
 
-  // idx1: y, idx2: x, idx3: z
-  if (perm[0] == 0 && perm[1] == 1) { // i, j
+  // idx0: z, idx1: y, idx2: x
+  if (perm[0] == 0 && perm[1] == 1)  // i, j
       for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS)
-          odata[pos1*nx*nz + (pos2+j)*nz + pos3] = 
-              idata[(pos2+j)*ny*nz + pos1*nz + pos3];
-  }
-
+          odata[(pos1+j)*nx*nz + pos2*nz + pos0] = 
+              idata[pos2*ny*nz + (pos1+j)*nz + pos0];
 }
 
 int main(int argc, char **argv)
@@ -214,13 +212,16 @@ int main(int argc, char **argv)
   int nx = sizes[0];
   int ny = sizes[1];
   int nz = sizes[2];
+  int n1,n2,n0;
 
   // should revise when dim > 3
-  int n1=sizes[perm[1]];
-  int n2=sizes[perm[0]];
-  int n3=sizes[0]+sizes[1]+sizes[2]-n1-n2; 
+  // exchange (0,1) is different from (0,2) and (1,2) 
+  // always assign threadIdx.x to z direction, 
+  n0 = sizes[2];
+  n1 = (perm[1]==1)?sizes[1]:sizes[perm[0]]; 
+  n2 = sizes[0]+sizes[1]+sizes[2]-n0-n1;
 
-  dim3 dimGrid(n1/TILE_DIM, n2/TILE_DIM, n3);
+  dim3 dimGrid(n0/TILE_DIM, n1/TILE_DIM, n2);
   dim3 dimBlock(TILE_DIM, BLOCK_ROWS, 1);
 
   int devId = 0;
