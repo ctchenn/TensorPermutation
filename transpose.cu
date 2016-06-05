@@ -43,7 +43,7 @@ cudaError_t checkCuda(cudaError_t result)
 }
 
 const int TILE_DIM = 32;
-const int BLOCK_ROWS = 8;
+const int BLOCK_ROWS = 2;
 const int NUM_REPS = 100;
 
 // Check errors and print GB/s
@@ -63,94 +63,101 @@ void postprocess(const float *ref, const float *res, int n, float ms)
 
 // simple copy kernel
 // Used as reference case representing best effective bandwidth.
-__global__ void copy(float *odata, const float *idata)
+__global__ void copy(float *odata, const float *idata, int nx, int ny)
 {
   int x = blockIdx.x * TILE_DIM + threadIdx.x;
   int y = blockIdx.y * TILE_DIM + threadIdx.y;
-  int width = gridDim.x * TILE_DIM;
+  //int width = gridDim.x * TILE_DIM;
+  if(!(x<nx && y<ny)) return; 
 
-  for (int j = 0; j < TILE_DIM; j+= BLOCK_ROWS)
-    odata[(y+j)*width + x] = idata[(y+j)*width + x];
+  for (int j = 0; j < TILE_DIM && y+j < ny; j+= BLOCK_ROWS)
+    //odata[(y+j)*width + x] = idata[(y+j)*width + x];
+    odata[(y+j)*nx + x] = idata[(y+j)*nx + x];
 }
 
 // copy kernel using shared memory
 // Also used as reference case, demonstrating effect of using shared memory.
-__global__ void copySharedMem(float *odata, const float *idata)
+__global__ void copySharedMem(float *odata, const float *idata, int nx, int ny)
 {
   __shared__ float tile[TILE_DIM * TILE_DIM];
   
   int x = blockIdx.x * TILE_DIM + threadIdx.x;
   int y = blockIdx.y * TILE_DIM + threadIdx.y;
-  int width = gridDim.x * TILE_DIM;
+  //int width = gridDim.x * TILE_DIM;
+  if(!(x<nx && y<ny)) return; 
 
-  for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS)
-     tile[(threadIdx.y+j)*TILE_DIM + threadIdx.x] = idata[(y+j)*width + x];
+
+  for (int j = 0; j < TILE_DIM && y+j < ny; j += BLOCK_ROWS)
+     tile[(threadIdx.y+j)*TILE_DIM + threadIdx.x] = idata[(y+j)*nx + x];
 
   __syncthreads();
 
-  for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS)
-     odata[(y+j)*width + x] = tile[(threadIdx.y+j)*TILE_DIM + threadIdx.x];          
+  for (int j = 0; j < TILE_DIM && y+j < ny; j += BLOCK_ROWS)
+     odata[(y+j)*nx + x] = tile[(threadIdx.y+j)*TILE_DIM + threadIdx.x];          
 }
 
 // naive transpose
 // Simplest transpose; doesn't use shared memory.
 // Global memory reads are coalesced but writes are not.
-__global__ void transposeNaive(float *odata, const float *idata)
+__global__ void transposeNaive(float *odata, const float *idata, int nx, int ny)
 {
   int x = blockIdx.x * TILE_DIM + threadIdx.x;
   int y = blockIdx.y * TILE_DIM + threadIdx.y;
-  int width = gridDim.x * TILE_DIM;
+  //int width = gridDim.x * TILE_DIM;
+  if(!(x<nx && y<ny)) return; 
 
-  for (int j = 0; j < TILE_DIM; j+= BLOCK_ROWS)
-    odata[x*width + (y+j)] = idata[(y+j)*width + x];
+  for (int j = 0; j < TILE_DIM && y+j < ny; j+= BLOCK_ROWS)
+    odata[x*ny + (y+j)] = idata[(y+j)*nx + x];
 }
 
 // coalesced transpose
 // Uses shared memory to achieve coalesing in both reads and writes
 // Tile width == #banks causes shared memory bank conflicts.
 
-__global__ void transposeCoalesced(float *odata, const float *idata)
+__global__ void transposeCoalesced(float *odata, const float *idata, int nx, int ny)
 {
   __shared__ float tile[TILE_DIM][TILE_DIM];
     
   int x = blockIdx.x * TILE_DIM + threadIdx.x;
   int y = blockIdx.y * TILE_DIM + threadIdx.y;
-  int width = gridDim.x * TILE_DIM;
-
-  for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS)
-     tile[threadIdx.y+j][threadIdx.x] = idata[(y+j)*width + x];
-
+  //int width = gridDim.x * TILE_DIM;
+  if(x<nx && y<ny) { 
+     for (int j = 0; j < TILE_DIM && y+j < ny; j += BLOCK_ROWS)
+        tile[threadIdx.y+j][threadIdx.x] = idata[(y+j)*nx + x];
+  }
   __syncthreads();
 
   x = blockIdx.y * TILE_DIM + threadIdx.x;  // transpose block offset
   y = blockIdx.x * TILE_DIM + threadIdx.y;
-
-  for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS)
-     odata[(y+j)*width + x] = tile[threadIdx.x][threadIdx.y + j];
+  if(x<ny && y<nx) {
+     for (int j = 0; j < TILE_DIM && y+j < nx; j += BLOCK_ROWS)
+        odata[(y+j)*ny + x] = tile[threadIdx.x][threadIdx.y + j];
+  }
 }
   
 
 // No bank-conflict transpose
 // Same as transposeCoalesced except the first tile dimension is padded 
 // to avoid shared memory bank conflicts.
-__global__ void transposeNoBankConflicts(float *odata, const float *idata)
+__global__ void transposeNoBankConflicts(float *odata, const float *idata, int nx, int ny)
 {
   __shared__ float tile[TILE_DIM][TILE_DIM+1];
     
   int x = blockIdx.x * TILE_DIM + threadIdx.x;
   int y = blockIdx.y * TILE_DIM + threadIdx.y;
-  int width = gridDim.x * TILE_DIM;
-
-  for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS)
-     tile[threadIdx.y+j][threadIdx.x] = idata[(y+j)*width + x];
-
+  //int width = gridDim.x * TILE_DIM;
+  if(x<nx && y<ny) { 
+     for (int j = 0; j < TILE_DIM && y+j < ny; j += BLOCK_ROWS)
+        tile[threadIdx.y+j][threadIdx.x] = idata[(y+j)*nx + x];
+  }
   __syncthreads();
 
   x = blockIdx.y * TILE_DIM + threadIdx.x;  // transpose block offset
   y = blockIdx.x * TILE_DIM + threadIdx.y;
-
-  for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS)
-     odata[(y+j)*width + x] = tile[threadIdx.x][threadIdx.y + j];
+  if(x<ny && y<nx) {
+     for (int j = 0; j < TILE_DIM && y+j < nx; j += BLOCK_ROWS)
+        odata[(y+j)*ny + x] = tile[threadIdx.x][threadIdx.y + j];
+  }
 }
 
 __global__ void transposeInplace(float *odata, const float *idata, const int* sizes, const int* perm, const int dim)
@@ -172,37 +179,42 @@ __global__ void transposeInplace(float *odata, const float *idata, const int* si
 
   // idx0 --> z, idx1 --> y, idx2 --> x 
   if (perm[0] == 1 and perm[1] == 2) {  // exchange j, k
-      for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS)
-          tile[idx1+j][(idx0+idx1+j)%TILE_DIM] = 
-              idata[pos2*ny*nz + (pos1+j)*nz + pos0];
-      __syncthreads();
-      for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS)
-          odata[pos2*nz*ny + (postpos1+j)*ny + postpos0] = 
-              tile[idx0][(idx1+j+idx0)%TILE_DIM];
+      if (pos2<nx && pos0 < nz && postpos0<ny) {
+          for (int j = 0; j < TILE_DIM && pos1+j<ny; j += BLOCK_ROWS)
+              tile[idx1+j][(idx0+idx1+j)%TILE_DIM] = 
+                  idata[pos2*ny*nz + (pos1+j)*nz + pos0];
+          __syncthreads();
+          for (int j = 0; j < TILE_DIM && postpos1+j<nz; j += BLOCK_ROWS)
+              odata[pos2*nz*ny + (postpos1+j)*ny + postpos0] = 
+                  tile[idx0][(idx1+j+idx0)%TILE_DIM];
+      }
   }
 
   // idx0: z, idx1: x, idx2: y
   if (perm[0] == 0 and perm[1] == 2) {  // i, k
-      for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS)
-          tile[idx1+j][(idx0+idx1+j)%TILE_DIM] = 
-              idata[(pos1+j)*ny*nz + pos2*nz + pos0];
-      __syncthreads();
-      for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS)
-          odata[(postpos1+j)*ny*nx + pos2*nx + postpos0] = 
-              tile[idx0][(idx1+j+idx0)%TILE_DIM];
+      if (pos2<ny && pos0<nz && postpos0<nx) {
+          for (int j = 0; j < TILE_DIM && pos1+j<nx; j += BLOCK_ROWS)
+              tile[idx1+j][(idx0+idx1+j)%TILE_DIM] = 
+                  idata[(pos1+j)*ny*nz + pos2*nz + pos0];
+          __syncthreads();
+          for (int j = 0; j < TILE_DIM && postpos1+j<nz; j += BLOCK_ROWS)
+              odata[(postpos1+j)*ny*nx + pos2*nx + postpos0] = 
+                  tile[idx0][(idx1+j+idx0)%TILE_DIM];
+      }
   }
 
   // idx0: z, idx1: y, idx2: x
   if (perm[0] == 0 && perm[1] == 1)  // i, j
-      for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS)
-          odata[(pos1+j)*nx*nz + pos2*nz + pos0] = 
-              idata[pos2*ny*nz + (pos1+j)*nz + pos0];
+      if (pos2<nx && pos0<nz)
+          for (int j = 0; j < TILE_DIM && pos1+j<ny; j += BLOCK_ROWS)
+              odata[(pos1+j)*nx*nz + pos2*nz + pos0] = 
+                  idata[pos2*ny*nz + (pos1+j)*nz + pos0];
 }
 
 int main(int argc, char **argv)
 {
   const int dim = 3;
-  const int sizes[3] = {64,64,64};
+  const int sizes[3] = {32,1024,1024};
   const int perm[2] = {0, 1};  // permuted dimensions in ascending order
   int scale = 1;
   for (int i = 0; i < dim; i++)
@@ -221,7 +233,7 @@ int main(int argc, char **argv)
   n1 = (perm[1]==1)?sizes[1]:sizes[perm[0]]; 
   n2 = sizes[0]+sizes[1]+sizes[2]-n0-n1;
 
-  dim3 dimGrid(n0/TILE_DIM, n1/TILE_DIM, n2);
+  dim3 dimGrid((n0-1)/TILE_DIM+1, (n1-1)/TILE_DIM+1, n2);
   dim3 dimBlock(TILE_DIM, BLOCK_ROWS, 1);
 
   int devId = 0;
@@ -251,6 +263,7 @@ int main(int argc, char **argv)
   checkCuda( cudaMalloc(&d_perm, 2*sizeof(int)) );
 
   // check parameters and calculate execution configuration
+  /*
   if (nx % TILE_DIM || ny % TILE_DIM) {
     printf("nx and ny must be a multiple of TILE_DIM\n");
     goto error_exit;
@@ -260,6 +273,7 @@ int main(int argc, char **argv)
     printf("TILE_DIM must be a multiple of BLOCK_ROWS\n");
     goto error_exit;
   }
+  */
     
   // host
   for (int i = 0; i < nx; i++)
@@ -301,10 +315,10 @@ int main(int argc, char **argv)
   printf("%25s", "copy");
   checkCuda( cudaMemset(d_cdata, 0, mem_size) );
   // warm up
-  copy<<<dimGrid, dimBlock>>>(d_cdata, d_idata);
+  copy<<<dimGrid, dimBlock>>>(d_cdata, d_idata,nx,ny);
   checkCuda( cudaEventRecord(startEvent, 0) );
   for (int i = 0; i < NUM_REPS; i++)
-     copy<<<dimGrid, dimBlock>>>(d_cdata, d_idata);
+     copy<<<dimGrid, dimBlock>>>(d_cdata, d_idata,nx,ny);
   checkCuda( cudaEventRecord(stopEvent, 0) );
   checkCuda( cudaEventSynchronize(stopEvent) );
   checkCuda( cudaEventElapsedTime(&ms, startEvent, stopEvent) );
@@ -317,10 +331,10 @@ int main(int argc, char **argv)
   printf("%25s", "shared memory copy");
   checkCuda( cudaMemset(d_cdata, 0, mem_size) );
   // warm up
-  copySharedMem<<<dimGrid, dimBlock>>>(d_cdata, d_idata);
+  copySharedMem<<<dimGrid, dimBlock>>>(d_cdata, d_idata,nx,ny);
   checkCuda( cudaEventRecord(startEvent, 0) );
   for (int i = 0; i < NUM_REPS; i++)
-     copySharedMem<<<dimGrid, dimBlock>>>(d_cdata, d_idata);
+     copySharedMem<<<dimGrid, dimBlock>>>(d_cdata, d_idata,nx,ny);
   checkCuda( cudaEventRecord(stopEvent, 0) );
   checkCuda( cudaEventSynchronize(stopEvent) );
   checkCuda( cudaEventElapsedTime(&ms, startEvent, stopEvent) );
@@ -333,10 +347,10 @@ int main(int argc, char **argv)
   printf("%25s", "naive transpose");
   checkCuda( cudaMemset(d_tdata, 0, mem_size) );
   // warmup
-  transposeNaive<<<dimGrid, dimBlock>>>(d_tdata, d_idata);
+  transposeNaive<<<dimGrid, dimBlock>>>(d_tdata, d_idata,nx,ny);
   checkCuda( cudaEventRecord(startEvent, 0) );
   for (int i = 0; i < NUM_REPS; i++)
-     transposeNaive<<<dimGrid, dimBlock>>>(d_tdata, d_idata);
+     transposeNaive<<<dimGrid, dimBlock>>>(d_tdata, d_idata,nx,ny);
   checkCuda( cudaEventRecord(stopEvent, 0) );
   checkCuda( cudaEventSynchronize(stopEvent) );
   checkCuda( cudaEventElapsedTime(&ms, startEvent, stopEvent) );
@@ -349,10 +363,10 @@ int main(int argc, char **argv)
   printf("%25s", "coalesced transpose");
   checkCuda( cudaMemset(d_tdata, 0, mem_size) );
   // warmup
-  transposeCoalesced<<<dimGrid, dimBlock>>>(d_tdata, d_idata);
+  transposeCoalesced<<<dimGrid, dimBlock>>>(d_tdata, d_idata,nx,ny);
   checkCuda( cudaEventRecord(startEvent, 0) );
   for (int i = 0; i < NUM_REPS; i++)
-     transposeCoalesced<<<dimGrid, dimBlock>>>(d_tdata, d_idata);
+     transposeCoalesced<<<dimGrid, dimBlock>>>(d_tdata, d_idata,nx,ny);
   checkCuda( cudaEventRecord(stopEvent, 0) );
   checkCuda( cudaEventSynchronize(stopEvent) );
   checkCuda( cudaEventElapsedTime(&ms, startEvent, stopEvent) );
@@ -365,10 +379,10 @@ int main(int argc, char **argv)
   printf("%25s", "conflict-free transpose");
   checkCuda( cudaMemset(d_tdata, 0, mem_size) );
   // warmup
-  transposeNoBankConflicts<<<dimGrid, dimBlock>>>(d_tdata, d_idata);
+  transposeNoBankConflicts<<<dimGrid, dimBlock>>>(d_tdata, d_idata,nx,ny);
   checkCuda( cudaEventRecord(startEvent, 0) );
   for (int i = 0; i < NUM_REPS; i++)
-     transposeNoBankConflicts<<<dimGrid, dimBlock>>>(d_tdata, d_idata);
+     transposeNoBankConflicts<<<dimGrid, dimBlock>>>(d_tdata, d_idata,nx,ny);
   checkCuda( cudaEventRecord(stopEvent, 0) );
   checkCuda( cudaEventSynchronize(stopEvent) );
   checkCuda( cudaEventElapsedTime(&ms, startEvent, stopEvent) );
@@ -390,7 +404,7 @@ int main(int argc, char **argv)
   checkCuda( cudaEventElapsedTime(&ms, startEvent, stopEvent) );
   checkCuda( cudaMemcpy(h_tdata, d_tdata, mem_size, cudaMemcpyDeviceToHost) );
   postprocess(gold, h_tdata, nx*ny*nz, ms);
-error_exit:
+  // error_exit:
   // cleanup
   checkCuda( cudaEventDestroy(startEvent) );
   checkCuda( cudaEventDestroy(stopEvent) );
