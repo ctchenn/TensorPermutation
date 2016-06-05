@@ -153,34 +153,74 @@ __global__ void transposeNoBankConflicts(float *odata, const float *idata)
      odata[(y+j)*width + x] = tile[threadIdx.x][threadIdx.y + j];
 }
 
-__global__ void transposeInplace(float *odata, const float *idata)
+__global__ void transposeInplace(float *odata, const float *idata, const int* sizes, const int* perm, const int dim)
 {
   __shared__ float tile[TILE_DIM][TILE_DIM];
 
-  int x = blockIdx.x * TILE_DIM + threadIdx.x;
-  int y = blockIdx.y * TILE_DIM + threadIdx.y;
-  int width = gridDim.x * TILE_DIM;
+  int idx1 = threadIdx.x;
+  int idx2 = threadIdx.y;
+  int idx3 = threadIdx.z;
+  int pos1 = blockIdx.x * TILE_DIM + idx1;  // transpose block offset
+  int pos2 = blockIdx.y * TILE_DIM + idx2;
+  int pos3 = blockIdx.z * 1 + idx3;   
+  int postpos1 = blockIdx.y * TILE_DIM + idx1;
+  int postpos2 = blockIdx.x * TILE_DIM + idx2;
+  assert(threadIdx.z==0);
+  const int nx = sizes[0];
+  const int ny = sizes[1];
+  const int nz = sizes[2];
 
-  for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS)
-     tile[threadIdx.y+j][(threadIdx.x+threadIdx.y+j)%TILE_DIM] = idata[(y+j)*width + x];
+  // idx1 --> z, idx2 --> y, idx3 --> x 
+  if (perm[0] == 1 and perm[1] == 2) {  // exchange j, k
+      for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS)
+          tile[idx2+j][(idx1+idx2+j)%TILE_DIM] = 
+              idata[pos3*ny*nz + (pos2+j)*nz + pos1];
+      __syncthreads();
+      for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS)
+          odata[pos3*nz*ny + (postpos2+j)*ny + postpos1] = 
+              tile[idx1][(idx2+j+idx1)%TILE_DIM];
+  }
 
-  __syncthreads();
+  // idx1: z, idx2: x, idx3: y
+  if (perm[0] == 0 and perm[1] == 2) {  // i, k
+      for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS)
+          tile[idx2+j][(idx1+idx2+j)%TILE_DIM] = 
+              idata[(pos2+j)*ny*nz + pos3*nz + pos1];
+      __syncthreads();
+      for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS)
+          odata[(postpos2+j)*ny*nx + pos3*nx + postpos1] = 
+              tile[idx1][(idx2+j+idx1)%TILE_DIM];
+  }
 
-  x = blockIdx.y * TILE_DIM + threadIdx.x;  // transpose block offset
-  y = blockIdx.x * TILE_DIM + threadIdx.y;
-
-  for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS)
-     odata[(y+j)*width + x] = tile[threadIdx.x][(threadIdx.y+j+threadIdx.x)%TILE_DIM];
+  // idx1: y, idx2: x, idx3: z
+  if (perm[0] == 0 && perm[1] == 1) { // i, j
+      for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS)
+          odata[pos1*nx*nz + (pos2+j)*nz + pos3] = 
+              idata[(pos2+j)*ny*nz + pos1*nz + pos3];
+  }
 
 }
 
 int main(int argc, char **argv)
 {
-  const int nx = 1024;
-  const int ny = 1024;
-  const int mem_size = nx*ny*sizeof(float);
+  const int dim = 3;
+  const int sizes[3] = {64,64,64};
+  const int perm[2] = {0, 1};  // permuted dimensions in ascending order
+  int scale = 1;
+  for (int i = 0; i < dim; i++)
+      scale *= sizes[i];  
+  const int mem_size = scale*sizeof(float);
+  
+  int nx = sizes[0];
+  int ny = sizes[1];
+  int nz = sizes[2];
 
-  dim3 dimGrid(nx/TILE_DIM, ny/TILE_DIM, 1);
+  // should revise when dim > 3
+  int n1=sizes[perm[1]];
+  int n2=sizes[perm[0]];
+  int n3=sizes[0]+sizes[1]+sizes[2]-n1-n2; 
+
+  dim3 dimGrid(n1/TILE_DIM, n2/TILE_DIM, n3);
   dim3 dimBlock(TILE_DIM, BLOCK_ROWS, 1);
 
   int devId = 0;
@@ -189,8 +229,8 @@ int main(int argc, char **argv)
   cudaDeviceProp prop;
   checkCuda( cudaGetDeviceProperties(&prop, devId));
   printf("\nDevice : %s\n", prop.name);
-  printf("Matrix size: %d %d, Block size: %d %d, Tile size: %d %d\n", 
-         nx, ny, TILE_DIM, BLOCK_ROWS, TILE_DIM, TILE_DIM);
+  printf("Matrix size: %d %d %d, Block size: %d %d, Tile size: %d %d\n", 
+         nx, ny, nz, TILE_DIM, BLOCK_ROWS, TILE_DIM, TILE_DIM);
   printf("dimGrid: %d %d %d. dimBlock: %d %d %d\n",
          dimGrid.x, dimGrid.y, dimGrid.z, dimBlock.x, dimBlock.y, dimBlock.z);
   
@@ -205,6 +245,9 @@ int main(int argc, char **argv)
   checkCuda( cudaMalloc(&d_idata, mem_size) );
   checkCuda( cudaMalloc(&d_cdata, mem_size) );
   checkCuda( cudaMalloc(&d_tdata, mem_size) );
+  int *d_sizes, *d_perm;
+  checkCuda( cudaMalloc(&d_sizes, 3*sizeof(int)) );
+  checkCuda( cudaMalloc(&d_perm, 2*sizeof(int)) );
 
   // check parameters and calculate execution configuration
   if (nx % TILE_DIM || ny % TILE_DIM) {
@@ -218,17 +261,27 @@ int main(int argc, char **argv)
   }
     
   // host
-  for (int j = 0; j < ny; j++)
-    for (int i = 0; i < nx; i++)
-      h_idata[j*nx + i] = j*nx + i;
+  for (int i = 0; i < nx; i++)
+      for (int j = 0; j < ny; j++)
+          for (int k = 0; k < nz; k++)
+              h_idata[i*ny*nz + j*nz + k] = i*ny*nz + j*nz + k;
 
   // correct result for error checking
-  for (int j = 0; j < ny; j++)
-    for (int i = 0; i < nx; i++)
-      gold[j*nx + i] = h_idata[i*nx + j];
+  for (int i = 0; i < nx; i++)
+      for (int j = 0; j < ny; j++)
+          for (int k = 0; k < nz; k++) {
+              if (perm[0] == 1 && perm[1] == 2)  // exchange j, k
+                  gold[i*ny*nz + k*ny + j] = h_idata[i*ny*nz + j*nz + k];
+              else if(perm[0] == 0 && perm[1] == 2)  // i, k
+                  gold[k*nx*ny + j*nx + i] = h_idata[i*ny*nz + j*nz + k];
+              else if(perm[0] == 0 && perm[1] == 1)  // i, j
+                  gold[j*nz*nx + i*nz + k] = h_idata[i*ny*nz + j*nz + k];
+          } 
   
   // device
   checkCuda( cudaMemcpy(d_idata, h_idata, mem_size, cudaMemcpyHostToDevice) );
+  checkCuda( cudaMemcpy(d_perm, perm, 2*sizeof(int), cudaMemcpyHostToDevice) );
+  checkCuda( cudaMemcpy(d_sizes, sizes, 3*sizeof(int), cudaMemcpyHostToDevice) );
   
   // events for timing
   cudaEvent_t startEvent, stopEvent;
@@ -240,7 +293,7 @@ int main(int argc, char **argv)
   // time kernels
   // ------------
   printf("%25s%25s\n", "Routine", "Bandwidth (GB/s)");
-  
+ /* 
   // ----
   // copy 
   // ----
@@ -320,22 +373,22 @@ int main(int argc, char **argv)
   checkCuda( cudaEventElapsedTime(&ms, startEvent, stopEvent) );
   checkCuda( cudaMemcpy(h_tdata, d_tdata, mem_size, cudaMemcpyDeviceToHost) );
   postprocess(gold, h_tdata, nx * ny, ms);
-
+*/
   // ------------------------
   // transposeInplace
   // ------------------------
   printf("%25s", "In-place transpose");
   checkCuda( cudaMemset(d_tdata, 0, mem_size) );
   // warmup
-  transposeInplace<<<dimGrid, dimBlock>>>(d_tdata, d_idata);
+  transposeInplace<<<dimGrid, dimBlock>>>(d_tdata, d_idata, d_sizes, d_perm, dim);
   checkCuda( cudaEventRecord(startEvent, 0) );
   for (int i = 0; i < NUM_REPS; i++)
-     transposeInplace<<<dimGrid, dimBlock>>>(d_tdata, d_idata);
+     transposeInplace<<<dimGrid, dimBlock>>>(d_tdata, d_idata, d_sizes, d_perm, dim);
   checkCuda( cudaEventRecord(stopEvent, 0) );
   checkCuda( cudaEventSynchronize(stopEvent) );
   checkCuda( cudaEventElapsedTime(&ms, startEvent, stopEvent) );
   checkCuda( cudaMemcpy(h_tdata, d_tdata, mem_size, cudaMemcpyDeviceToHost) );
-  postprocess(gold, h_tdata, nx * ny, ms);
+  postprocess(gold, h_tdata, nx*ny*nz, ms);
 error_exit:
   // cleanup
   checkCuda( cudaEventDestroy(startEvent) );
