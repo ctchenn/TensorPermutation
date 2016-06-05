@@ -99,15 +99,30 @@ __global__ void copySharedMem(float *odata, const float *idata, int nx, int ny)
 // naive transpose
 // Simplest transpose; doesn't use shared memory.
 // Global memory reads are coalesced but writes are not.
-__global__ void transposeNaive(float *odata, const float *idata, int nx, int ny)
+__global__ void transposeNaive(float *odata, const float *idata, const int* sizes, const int* perm, const int dim)
 {
-  int x = blockIdx.x * TILE_DIM + threadIdx.x;
-  int y = blockIdx.y * TILE_DIM + threadIdx.y;
-  //int width = gridDim.x * TILE_DIM;
-  if(!(x<nx && y<ny)) return; 
+  int pos0 = blockIdx.x * TILE_DIM + threadIdx.x;
+  int pos1 = blockIdx.y * TILE_DIM + threadIdx.y;
+  int pos2 = blockIdx.z * 1 + threadIdx.z;
+  const int nx = sizes[0];
+  const int ny = sizes[1];
+  const int nz = sizes[2];
 
-  for (int j = 0; j < TILE_DIM && y+j < ny; j+= BLOCK_ROWS)
-    odata[x*ny + (y+j)] = idata[(y+j)*nx + x];
+  if (perm[0] == 1 and perm[1] == 2)   // exchange j, k
+      if (pos0<nz && pos1<ny && pos2<nx)
+          for (int j = 0; j < TILE_DIM && pos1+j<ny; j += BLOCK_ROWS)
+              odata[pos2*nz*ny + pos0*ny + pos1+j] = 
+                  idata[pos2*nx*nz + (pos1+j)*nz + pos0];
+  if (perm[0] == 0 and perm[1] == 2)   // i, k
+      if (pos0<nz && pos1<nx && pos2<ny)
+          for (int j = 0; j < TILE_DIM && pos1+j<nx; j += BLOCK_ROWS)
+              odata[pos0*nx*ny + (pos1+j)*ny + pos2] = 
+                  idata[pos2*nx*nz + (pos1+j)*nz + pos0];
+  if (perm[0] == 0 and perm[1] == 1)   // i, j
+      if (pos0<nz && pos1<ny && pos2<nx)
+          for (int j = 0; j < TILE_DIM && pos1+j<ny; j += BLOCK_ROWS)
+              odata[(pos1+j)*nx*nz + pos2*nz + pos0] = 
+                  idata[pos2*ny*nz + (pos1+j)*nz + pos0];
 }
 
 // coalesced transpose
@@ -214,7 +229,7 @@ __global__ void transposeInplace(float *odata, const float *idata, const int* si
 int main(int argc, char **argv)
 {
   const int dim = 3;
-  const int sizes[3] = {32,1024,1024};
+  const int sizes[3] = {3,1024,1024};
   const int perm[2] = {0, 1};  // permuted dimensions in ascending order
   int scale = 1;
   for (int i = 0; i < dim; i++)
@@ -340,6 +355,7 @@ int main(int argc, char **argv)
   checkCuda( cudaEventElapsedTime(&ms, startEvent, stopEvent) );
   checkCuda( cudaMemcpy(h_cdata, d_cdata, mem_size, cudaMemcpyDeviceToHost) );
   postprocess(h_idata, h_cdata, nx * ny, ms);
+*/
 
   // --------------
   // transposeNaive 
@@ -347,16 +363,16 @@ int main(int argc, char **argv)
   printf("%25s", "naive transpose");
   checkCuda( cudaMemset(d_tdata, 0, mem_size) );
   // warmup
-  transposeNaive<<<dimGrid, dimBlock>>>(d_tdata, d_idata,nx,ny);
+  transposeNaive<<<dimGrid, dimBlock>>>(d_tdata, d_idata, d_sizes, d_perm, dim);
   checkCuda( cudaEventRecord(startEvent, 0) );
   for (int i = 0; i < NUM_REPS; i++)
-     transposeNaive<<<dimGrid, dimBlock>>>(d_tdata, d_idata,nx,ny);
+     transposeNaive<<<dimGrid, dimBlock>>>(d_tdata, d_idata, d_sizes, d_perm, dim);
   checkCuda( cudaEventRecord(stopEvent, 0) );
   checkCuda( cudaEventSynchronize(stopEvent) );
   checkCuda( cudaEventElapsedTime(&ms, startEvent, stopEvent) );
   checkCuda( cudaMemcpy(h_tdata, d_tdata, mem_size, cudaMemcpyDeviceToHost) );
-  postprocess(gold, h_tdata, nx * ny, ms);
-
+  postprocess(gold, h_tdata, nx*ny*nz, ms);
+/*
   // ------------------
   // transposeCoalesced 
   // ------------------
