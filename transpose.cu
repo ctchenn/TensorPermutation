@@ -256,45 +256,61 @@ __global__ void transposeInplace(float *odata, const float *idata, const int* si
                   idata[pos2*ny*nz + (pos1+j)*nz + pos0];
 }
 
+
 int main(int argc, char **argv)
 {
-  const int dim = 3;
-  int sizes[3];
-  sizes[0] = atoi(argv[1]);
-  sizes[1] = atoi(argv[2]);
-  sizes[2] = atoi(argv[3]);
+  int dim=0;
+  int sizes[dim];
   int perm[2];  // permuted dimensions in ascending order
-  perm[0] = atoi(argv[4]);
-  perm[1] = atoi(argv[5]);
+  int i=1;
+  while(i<argc){
+     if(strcmp(argv[i],"-d")==0){
+        i++;
+        dim = atoi(argv[i++]);
+     }
+     else if(strcmp(argv[i],"-s")==0){
+        assert(dim!=0);
+        i++;
+        for(int j=0;j<dim;j++){
+           sizes[j]=atoi(argv[i++]);
+        }
+     }
+     else if(strcmp(argv[i],"-p")==0){
+        i++;
+        perm[0]=atoi(argv[i++]);
+        perm[1]=atoi(argv[i++]);
+     }
+
+  }
+
   int scale = 1;
   for (int i = 0; i < dim; i++)
       scale *= sizes[i];  
   const int mem_size = scale*sizeof(float);
   
-  int nx = sizes[0];
-  int ny = sizes[1];
-  int nz = sizes[2];
-  int n1,n2,n0;
+  int nff, nf; // faster, fast
 
   // should revise when dim > 3
   // exchange (0,1) is different from (0,2) and (1,2) 
   // always assign threadIdx.x to z direction, 
-  n0 = sizes[2];
-  n1 = (perm[1]==1)?sizes[1]:sizes[perm[0]]; 
-  n2 = sizes[0]+sizes[1]+sizes[2]-n0-n1;
+  nff = sizes[dim-1];
+  nf = (perm[1]==dim-1)?sizes[perm[0]]:sizes[dim-2]; // if involving last dim, then the other dim; else the one next to the last dim
 
-  dim3 dimGrid((n0-1)/TILE_DIM+1, (n1-1)/TILE_DIM+1, n2);
+  dim3 dimGrid((nff-1)/TILE_DIM+1, (nf-1)/TILE_DIM+1, scale/(nff*nf));
   dim3 dimBlock(TILE_DIM, BLOCK_ROWS, 1);
 
   int devId = 2;
-  if (argc > 1) devId = atoi(argv[1]);
+  // if (argc > 1) devId = atoi(argv[1]);
 
   cudaDeviceProp prop;
   checkCuda( cudaGetDeviceProperties(&prop, devId));
   printf("\nDevice : %s\n", prop.name);
   printf("perm order: (%d, %d)\n", perm[0], perm[1]);
-  printf("Matrix size: %d %d %d, Block size: %d %d, Tile size: %d %d\n", 
-         nx, ny, nz, TILE_DIM, BLOCK_ROWS, TILE_DIM, TILE_DIM);
+  printf("Matrix size: ");
+  for (int i =0; i<dim; i++)
+      printf("%d ", sizes[i]);
+  printf("\n");
+  printf("Block size: %d %d, Tile size: %d %d\n", TILE_DIM, BLOCK_ROWS, TILE_DIM, TILE_DIM);
   printf("dimGrid: %d %d %d. dimBlock: %d %d %d\n",
          dimGrid.x, dimGrid.y, dimGrid.z, dimBlock.x, dimBlock.y, dimBlock.z);
   
@@ -327,22 +343,38 @@ int main(int argc, char **argv)
   */
     
   // host
-  for (int i = 0; i < nx; i++)
-      for (int j = 0; j < ny; j++)
-          for (int k = 0; k < nz; k++)
-              h_idata[i*ny*nz + j*nz + k] = i*ny*nz + j*nz + k;
+  for (int i=0;i<scale;i++) 
+      h_idata[i]=i;
+
+  int sizes_perm[dim];
+  for (int i=0;i<dim;i++) sizes_perm[i]=sizes[i];
+  sizes_perm[perm[0]] = sizes[perm[1]];
+  sizes_perm[perm[1]] = sizes[perm[0]];
+
+  for (int i=0;i<scale;i++){
+      int index[dim];
+      int lower_scale = scale;
+      int tmpi = i;
+      for(int j=0;j<dim;j++){
+         lower_scale /= sizes_perm[j];
+         index[j] = tmpi/lower_scale;
+         tmpi %= lower_scale;
+      }
+      int t=index[perm[0]];
+      index[perm[0]]=index[perm[1]];
+      index[perm[1]]=t;
+      
+      lower_scale = scale;
+      int ans_index = 0;
+      for(int j=0;j<dim;j++){
+         lower_scale /= sizes[j];
+         ans_index += index[j]*lower_scale;
+      }
+      gold[i] = h_idata[ans_index];
+  }
+
 
   // correct result for error checking
-  for (int i = 0; i < nx; i++)
-      for (int j = 0; j < ny; j++)
-          for (int k = 0; k < nz; k++) {
-              if (perm[0] == 1 && perm[1] == 2)  // exchange j, k
-                  gold[i*ny*nz + k*ny + j] = h_idata[i*ny*nz + j*nz + k];
-              else if(perm[0] == 0 && perm[1] == 2)  // i, k
-                  gold[k*nx*ny + j*nx + i] = h_idata[i*ny*nz + j*nz + k];
-              else if(perm[0] == 0 && perm[1] == 1)  // i, j
-                  gold[j*nz*nx + i*nz + k] = h_idata[i*ny*nz + j*nz + k];
-          } 
   
   // device
   checkCuda( cudaMemcpy(d_idata, h_idata, mem_size, cudaMemcpyHostToDevice) );
@@ -407,7 +439,7 @@ int main(int argc, char **argv)
   checkCuda( cudaEventSynchronize(stopEvent) );
   checkCuda( cudaEventElapsedTime(&ms, startEvent, stopEvent) );
   checkCuda( cudaMemcpy(h_tdata, d_tdata, mem_size, cudaMemcpyDeviceToHost) );
-  postprocess(gold, h_tdata, nx*ny*nz, ms);
+  postprocess(gold, h_tdata, scale, ms);
 /*
   // ------------------
   // transposeCoalesced 
@@ -455,7 +487,7 @@ int main(int argc, char **argv)
   checkCuda( cudaEventSynchronize(stopEvent) );
   checkCuda( cudaEventElapsedTime(&ms, startEvent, stopEvent) );
   checkCuda( cudaMemcpy(h_tdata, d_tdata, mem_size, cudaMemcpyDeviceToHost) );
-  postprocess(gold, h_tdata, nx*ny*nz, ms);
+  postprocess(gold, h_tdata, scale, ms);
   // error_exit:
   // cleanup
   checkCuda( cudaEventDestroy(startEvent) );
