@@ -50,6 +50,32 @@ const int NUM_REPS = 100;
 void postprocess(const float *ref, const float *res, int n, float ms)
 {
   bool passed = true;
+  /*
+  printf("\nreference:\n");
+  
+  for (int i=0; i<16; i++) {
+      for (int j=0; j<16; j++) {
+          printf("(");
+          for (int k=0; k<2; k++)
+              printf("%3.0f ", ref[i*2*16 + j * 2 + k]);
+          printf(")");
+      }
+      printf("\n");
+  }
+  printf("\n");
+  printf("\nresult:\n");
+  for (int i=0; i<16; i++) {
+      for (int j=0; j<16; j++) {
+          printf("(");
+          for (int k=0; k<2; k++)
+              printf("%3.0f ", res[i*16*2 + j * 2 + k]);
+          printf(")");
+      }
+      printf("\n");
+  }
+  printf("\n");
+  */
+  
   for (int i = 0; i < n; i++)
     if (res[i] != ref[i]) {
       printf("%d %f %f\n", i, res[i], ref[i]);
@@ -112,12 +138,12 @@ __global__ void transposeNaive(float *odata, const float *idata, const int* size
       if (pos0<nz && pos1<ny && pos2<nx)
           for (int j = 0; j < TILE_DIM && pos1+j<ny; j += BLOCK_ROWS)
               odata[pos2*nz*ny + pos0*ny + pos1+j] = 
-                  idata[pos2*nx*nz + (pos1+j)*nz + pos0];
-  if (perm[0] == 0 and perm[1] == 2)   // i, k
+                  idata[pos2*ny*nz + (pos1+j)*nz + pos0];
+  if (perm[0] == 0 and perm[1] == 2)   // i, k. pos0:z, pos1:x, pos2:y
       if (pos0<nz && pos1<nx && pos2<ny)
           for (int j = 0; j < TILE_DIM && pos1+j<nx; j += BLOCK_ROWS)
-              odata[pos0*nx*ny + (pos1+j)*ny + pos2] = 
-                  idata[pos2*nx*nz + (pos1+j)*nz + pos0];
+              odata[pos0*nx*ny + pos2*nx + (pos1+j)] = 
+                  idata[(pos1+j)*ny*nz + pos2*nz + pos0];
   if (perm[0] == 0 and perm[1] == 1)   // i, j
       if (pos0<nz && pos1<ny && pos2<nx)
           for (int j = 0; j < TILE_DIM && pos1+j<ny; j += BLOCK_ROWS)
@@ -194,11 +220,13 @@ __global__ void transposeInplace(float *odata, const float *idata, const int* si
 
   // idx0 --> z, idx1 --> y, idx2 --> x 
   if (perm[0] == 1 and perm[1] == 2) {  // exchange j, k
-      if (pos2<nx && pos0 < nz && postpos0<ny) {
+      if (pos2<nx && pos0 < nz) {
           for (int j = 0; j < TILE_DIM && pos1+j<ny; j += BLOCK_ROWS)
               tile[idx1+j][(idx0+idx1+j)%TILE_DIM] = 
                   idata[pos2*ny*nz + (pos1+j)*nz + pos0];
-          __syncthreads();
+      }
+      __syncthreads();
+      if (pos2<nx && postpos0<ny) {
           for (int j = 0; j < TILE_DIM && postpos1+j<nz; j += BLOCK_ROWS)
               odata[pos2*nz*ny + (postpos1+j)*ny + postpos0] = 
                   tile[idx0][(idx1+j+idx0)%TILE_DIM];
@@ -207,11 +235,13 @@ __global__ void transposeInplace(float *odata, const float *idata, const int* si
 
   // idx0: z, idx1: x, idx2: y
   if (perm[0] == 0 and perm[1] == 2) {  // i, k
-      if (pos2<ny && pos0<nz && postpos0<nx) {
+      if (pos2<ny && pos0<nz) {
           for (int j = 0; j < TILE_DIM && pos1+j<nx; j += BLOCK_ROWS)
               tile[idx1+j][(idx0+idx1+j)%TILE_DIM] = 
                   idata[(pos1+j)*ny*nz + pos2*nz + pos0];
-          __syncthreads();
+      }
+      __syncthreads();
+      if (pos2<ny && postpos0 < nx) {
           for (int j = 0; j < TILE_DIM && postpos1+j<nz; j += BLOCK_ROWS)
               odata[(postpos1+j)*ny*nx + pos2*nx + postpos0] = 
                   tile[idx0][(idx1+j+idx0)%TILE_DIM];
@@ -229,8 +259,13 @@ __global__ void transposeInplace(float *odata, const float *idata, const int* si
 int main(int argc, char **argv)
 {
   const int dim = 3;
-  const int sizes[3] = {3,1024,1024};
-  const int perm[2] = {0, 1};  // permuted dimensions in ascending order
+  int sizes[3];
+  sizes[0] = atoi(argv[1]);
+  sizes[1] = atoi(argv[2]);
+  sizes[2] = atoi(argv[3]);
+  int perm[2];  // permuted dimensions in ascending order
+  perm[0] = atoi(argv[4]);
+  perm[1] = atoi(argv[5]);
   int scale = 1;
   for (int i = 0; i < dim; i++)
       scale *= sizes[i];  
@@ -251,12 +286,13 @@ int main(int argc, char **argv)
   dim3 dimGrid((n0-1)/TILE_DIM+1, (n1-1)/TILE_DIM+1, n2);
   dim3 dimBlock(TILE_DIM, BLOCK_ROWS, 1);
 
-  int devId = 0;
+  int devId = 2;
   if (argc > 1) devId = atoi(argv[1]);
 
   cudaDeviceProp prop;
   checkCuda( cudaGetDeviceProperties(&prop, devId));
   printf("\nDevice : %s\n", prop.name);
+  printf("perm order: (%d, %d)\n", perm[0], perm[1]);
   printf("Matrix size: %d %d %d, Block size: %d %d, Tile size: %d %d\n", 
          nx, ny, nz, TILE_DIM, BLOCK_ROWS, TILE_DIM, TILE_DIM);
   printf("dimGrid: %d %d %d. dimBlock: %d %d %d\n",
