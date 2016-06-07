@@ -256,6 +256,109 @@ __global__ void transposeInplace(float *odata, const float *idata, const int* si
                   idata[pos2*ny*nz + (pos1+j)*nz + pos0];
 }
 
+__host__ __device__ void arridxToNumidx(int& numidx, int* arridx, const int* sizes, const int dim, const int scale) {
+   int lower_scale = scale;
+   numidx = 0;
+   for(int i=0;i<dim;i++){
+      lower_scale /= sizes[i];
+      numidx += arridx[i]*lower_scale;
+   }
+}
+
+__host__ __device__ void numidxToArridx(int* arridx, int numidx, const int* sizes, const int dim, const int scale) {
+   int lower_scale = scale;
+   for(int i=0;i<dim;i++){
+      lower_scale /= sizes[i];
+      arridx[i] = numidx / lower_scale;
+      numidx %= lower_scale;
+   }
+}
+
+__host__ __device__ int checkRange(const int* arridx, const int* sizes, const int dim) {
+   int ret=1;
+   for(int i=0;i<dim;i++){
+      if(arridx[i] >= sizes[i]) {
+         ret=0;
+	 break;
+      }
+   }
+   return ret;
+}
+__global__ void transposeInplaceMultiDim(float *odata, const float *idata, const int* sizes, const int* sizes_perm, const int* perm, const int dim, const int scale){
+  __shared__ float tile[TILE_DIM][TILE_DIM];
+  int idxff = threadIdx.x;
+  int idxf = threadIdx.y;
+  int posff = blockIdx.x * TILE_DIM + idxff;
+  int posf = blockIdx.y * TILE_DIM + idxf;
+  int posl = blockIdx.z; 
+  int postposff = blockIdx.y * TILE_DIM + idxff;
+  int postposf = blockIdx.x * TILE_DIM + idxf;
+  int scale_remaining = scale/sizes[perm[0]]/sizes[perm[1]];
+
+  int arridx[10], arridx_out[10], arridx_2[10], sizes_2[10];    // assume maximum dimension=10
+  int numidx, numidx_out;
+   
+  int d=0;
+  for(int j=0;j<dim;j++)
+     if(j!=perm[0] && j!=perm[1])
+         sizes_2[d++] = sizes[j];
+  numidxToArridx(arridx_2, posl, sizes_2, dim-2, scale_remaining);
+  
+  if(perm[1]==dim-1) {
+      // find the corresponding arridx of this thread
+      d=0;
+      for(int j=0;j<dim;j++){
+         if(j!=perm[0] && j!=dim-1)
+             arridx[j] = arridx_2[d++];
+         else if(j==perm[0]) 
+	     arridx[j] = posf;
+         else
+	     arridx[j] = posff;
+      } 
+      ///////////////////////////////////////////////
+
+      if (checkRange(arridx, sizes, dim)) {  // can be improved
+         for(int j = 0; j < TILE_DIM && posf+j < sizes[perm[0]]; j += BLOCK_ROWS){
+            arridx[perm[0]] = posf+j;   // can be improved !!!!!!!!
+            arridxToNumidx(numidx, arridx, sizes, dim, scale);  // can be improved
+	    tile[idxf+j][(idxf+idxff+j)%TILE_DIM] = idata[numidx];
+         } 
+      }
+      __syncthreads();
+
+      // find the corresponding arridx of this thread
+      arridx[dim-1]=postposff;
+      arridx[perm[0]]=postposf;
+      ///////////////////////////////////////////////
+  
+      if (checkRange(arridx, sizes_perm, dim)) {
+         for(int j = 0; j < TILE_DIM && postposf+j < sizes[dim-1]; j += BLOCK_ROWS ){
+            arridx[perm[0]] = postposf+j;
+	    arridxToNumidx(numidx, arridx, sizes_perm, dim, scale);
+	    odata[numidx] = tile[idxff][(idxf+idxff+j)%TILE_DIM];
+         }
+      }
+  }
+  else {
+      for(int j=0;j<dim-2;j++){  
+	 arridx[j] = arridx_out[j] = arridx_2[j];
+      }
+      arridx[dim-2] = arridx_out[dim-2] = posf;
+      arridx[dim-1] = arridx_out[dim-1] = posff;
+      arridx_out[perm[0]] = arridx[perm[1]];
+      arridx_out[perm[1]] = arridx[perm[0]];
+      if(checkRange(arridx, sizes, dim)){
+          for(int j=0;j<TILE_DIM && posf+j<sizes[dim-2];j+=BLOCK_ROWS){
+	     arridx[dim-2] = posf+j;
+	     if(perm[1] == dim-2) arridx_out[perm[0]] = posf+j;
+	     else arridx_out[dim-2] = posf+j;
+	     arridxToNumidx(numidx, arridx, sizes, dim, scale);
+	     arridxToNumidx(numidx_out, arridx_out, sizes_perm, dim, scale);
+	     odata[numidx_out] = idata[numidx];
+	  }
+      } 
+  }
+}
 
 int main(int argc, char **argv)
 {
@@ -283,6 +386,11 @@ int main(int argc, char **argv)
 
   }
 
+  if(perm[0] > perm[1]){
+     int t=perm[0];
+     perm[0]=perm[1];
+     perm[1]=t;
+  }
   int scale = 1;
   for (int i = 0; i < dim; i++)
       scale *= sizes[i];  
@@ -325,8 +433,9 @@ int main(int argc, char **argv)
   checkCuda( cudaMalloc(&d_idata, mem_size) );
   checkCuda( cudaMalloc(&d_cdata, mem_size) );
   checkCuda( cudaMalloc(&d_tdata, mem_size) );
-  int *d_sizes, *d_perm;
-  checkCuda( cudaMalloc(&d_sizes, 3*sizeof(int)) );
+  int *d_sizes, *d_sizes_perm, *d_perm;
+  checkCuda( cudaMalloc(&d_sizes, dim*sizeof(int)) );
+  checkCuda( cudaMalloc(&d_sizes_perm, dim*sizeof(int)) );
   checkCuda( cudaMalloc(&d_perm, 2*sizeof(int)) );
 
   // check parameters and calculate execution configuration
@@ -351,25 +460,14 @@ int main(int argc, char **argv)
   sizes_perm[perm[0]] = sizes[perm[1]];
   sizes_perm[perm[1]] = sizes[perm[0]];
 
-  for (int i=0;i<scale;i++){
-      int index[dim];
-      int lower_scale = scale;
-      int tmpi = i;
-      for(int j=0;j<dim;j++){
-         lower_scale /= sizes_perm[j];
-         index[j] = tmpi/lower_scale;
-         tmpi %= lower_scale;
-      }
+  int index[dim];
+  for (int i=0;i<scale;i++){ 
+      numidxToArridx(index, i, sizes_perm, dim, scale);
       int t=index[perm[0]];
       index[perm[0]]=index[perm[1]];
       index[perm[1]]=t;
-      
-      lower_scale = scale;
-      int ans_index = 0;
-      for(int j=0;j<dim;j++){
-         lower_scale /= sizes[j];
-         ans_index += index[j]*lower_scale;
-      }
+      int ans_index;
+      arridxToNumidx(ans_index, index, sizes, dim, scale);
       gold[i] = h_idata[ans_index];
   }
 
@@ -379,8 +477,10 @@ int main(int argc, char **argv)
   // device
   checkCuda( cudaMemcpy(d_idata, h_idata, mem_size, cudaMemcpyHostToDevice) );
   checkCuda( cudaMemcpy(d_perm, perm, 2*sizeof(int), cudaMemcpyHostToDevice) );
-  checkCuda( cudaMemcpy(d_sizes, sizes, 3*sizeof(int), cudaMemcpyHostToDevice) );
+  checkCuda( cudaMemcpy(d_sizes, sizes, dim*sizeof(int), cudaMemcpyHostToDevice) );
+  checkCuda( cudaMemcpy(d_sizes_perm, sizes_perm, dim*sizeof(int), cudaMemcpyHostToDevice) );
   
+
   // events for timing
   cudaEvent_t startEvent, stopEvent;
   checkCuda( cudaEventCreate(&startEvent) );
@@ -428,6 +528,7 @@ int main(int argc, char **argv)
   // --------------
   // transposeNaive 
   // --------------
+  
   printf("%25s", "naive transpose");
   checkCuda( cudaMemset(d_tdata, 0, mem_size) );
   // warmup
@@ -488,7 +589,25 @@ int main(int argc, char **argv)
   checkCuda( cudaEventElapsedTime(&ms, startEvent, stopEvent) );
   checkCuda( cudaMemcpy(h_tdata, d_tdata, mem_size, cudaMemcpyDeviceToHost) );
   postprocess(gold, h_tdata, scale, ms);
-  // error_exit:
+  
+  // ------------------------
+  // transposeInplaceMultiDimension
+  // ------------------------
+  
+     printf("%25s", "In-place last dim");
+     checkCuda( cudaMemset(d_tdata, 0, mem_size) );
+     // warmup
+     transposeInplaceMultiDim<<<dimGrid, dimBlock>>>(d_tdata, d_idata, d_sizes, d_sizes_perm, d_perm, dim, scale);
+     checkCuda( cudaEventRecord(startEvent, 0) );
+     for (int i = 0; i < NUM_REPS; i++)
+        transposeInplaceMultiDim<<<dimGrid, dimBlock>>>(d_tdata, d_idata, d_sizes, d_sizes_perm, d_perm, dim, scale);
+     checkCuda( cudaEventRecord(stopEvent, 0) );
+     checkCuda( cudaEventSynchronize(stopEvent) );
+     checkCuda( cudaEventElapsedTime(&ms, startEvent, stopEvent) );
+     checkCuda( cudaMemcpy(h_tdata, d_tdata, mem_size, cudaMemcpyDeviceToHost) );
+     postprocess(gold, h_tdata, scale, ms);
+  
+  
   // cleanup
   checkCuda( cudaEventDestroy(startEvent) );
   checkCuda( cudaEventDestroy(stopEvent) );
