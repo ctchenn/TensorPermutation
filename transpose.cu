@@ -43,7 +43,7 @@ cudaError_t checkCuda(cudaError_t result)
 }
 
 const int TILE_DIM = 32;
-const int BLOCK_ROWS = 1;
+const int BLOCK_ROWS = 2;
 const int NUM_REPS = 100;
 
 // Check errors and print GB/s
@@ -51,25 +51,25 @@ void postprocess(const float *ref, const float *res, int n, float ms)
 {
   bool passed = true;
   
-  
-/*  printf("\nreference:\n");
-  for (int i=0; i<2; i++) {
-      for (int j=0; j<2; j++) {
-          printf("(i,j)=(%d,%d)\n", i,j);
-          for (int k=0; k<64; k++)
-              printf("%3.0f ", ref[i*2*64 + j * 64 + k]);
-          printf("\n");
+/*  
+  printf("\nreference:\n");
+  for (int i=0; i<16; i++) {
+      for (int j=0; j<16; j++) {
+          printf("(");
+          for (int k=0; k<2; k++)
+              printf("%3.0f ", ref[i*16*2 + j * 2 + k]);
+          printf(")");
       }
       printf("\n");
   }
   printf("\n");
   printf("\nresult:\n");
-  for (int i=0; i<2; i++) {
-      for (int j=0; j<2; j++) {
-          printf("(i,j)=(%d,%d)\n",i,j);
-          for (int k=0; k<64; k++)
-              printf("%3.0f ", res[i*2*64 + j * 64 + k]);
-          printf("\n");
+  for (int i=0; i<16; i++) {
+      for (int j=0; j<16; j++) {
+          printf("(");
+          for (int k=0; k<2; k++)
+              printf("%3.0f ", res[i*16*2 + j * 2 + k]);
+          printf(")");
       }
       printf("\n");
   }
@@ -440,12 +440,64 @@ __global__ void transposeNaive(float *odata, const float *idata, const int* size
   } 
 }
 
+__global__ void shuffle(float *odata, const float *idata, const int* sizes, const int* sizes_shuf, const int* shuf, const int dim, const int scale)
+{
+  int idxff = threadIdx.x;
+  int idxf = threadIdx.y;
+
+  // diagonal
+  int bid = blockIdx.x + gridDim.x*blockIdx.y;
+  int blockIdx_y = bid%gridDim.y;
+  int blockIdx_x = ((bid/gridDim.y)+blockIdx_y)%gridDim.x;
+  
+  int posff = blockIdx_x * TILE_DIM + idxff;
+  int posf = blockIdx_y * TILE_DIM + idxf;
+  int posl = blockIdx.z; 
+  int scale_remaining = scale/sizes[dim-1]/sizes[dim-2];
+  
+  int arridx[10], arridx_out[10], arridx_2[10], sizes_2[10];    // assume maximum dimension=10
+  int numidx, numidx_out;
+   
+  int d=0;
+  for(int j=0;j<dim-2;j++)
+     sizes_2[d++] = sizes[j];
+  numidxToArridx(arridx_2, posl, sizes_2, dim-2, scale_remaining);
+
+  for(int j=0;j<dim-2;j++){  
+      arridx[j] = arridx_2[j];
+  }
+  arridx[dim-2] = posf;
+  arridx[dim-1] = posff;
+  numidx = posl*sizes[dim-2]*sizes[dim-1]+posf*sizes[dim-1]+posff;
+  for(int j=0;j<dim;j++){
+     arridx_out[j] = arridx[shuf[j]];
+  } 
+  arridxToNumidx(numidx_out, arridx_out, sizes_shuf, dim, scale);
+  int numidx_incr = BLOCK_ROWS * sizes[dim-1];
+  int numidx_out_incr;
+  int tmptmp = 1;
+  for(int j=dim-1;shuf[j]!=dim-2;j--)
+      tmptmp*=sizes_shuf[j];
+  numidx_out_incr = BLOCK_ROWS*tmptmp;
+  if(checkRange(arridx, sizes, dim)) {
+      for(int j=0;j<TILE_DIM && posf+j<sizes[dim-2];j+=BLOCK_ROWS){
+         odata[numidx_out] = idata[numidx];
+         numidx += numidx_incr;
+         numidx_out += numidx_out_incr;
+      }
+  }
+}
+
 int main(int argc, char **argv)
 {
   int dim=0;
-  int sizes[dim];
+  int sizes[10];    //assume dim<10
+  int shuf[10];
   int perm[2];  // permuted dimensions in ascending order
+  
   int i=1;
+  int perm_specified = 0;
+  int shuf_specified = 0;
   while(i<argc){
      if(strcmp(argv[i],"-d")==0){
         i++;
@@ -462,11 +514,18 @@ int main(int argc, char **argv)
         i++;
         perm[0]=atoi(argv[i++]);
         perm[1]=atoi(argv[i++]);
+        perm_specified = 1;
      }
-
+     else if(strcmp(argv[i],"-sf")==0){
+        i++;
+        for(int j=0;j<dim;j++){
+           shuf[j]=atoi(argv[i++]);
+        }
+        shuf_specified = 1;
+     }
   }
 
-  if(perm[0] > perm[1]){
+  if(perm_specified && perm[0] > perm[1]){
      int t=perm[0];
      perm[0]=perm[1];
      perm[1]=t;
@@ -477,19 +536,25 @@ int main(int argc, char **argv)
   const int mem_size = scale*sizeof(float);
  
   int magic_scale = 1;
-  for (int i=perm[0]+1;i<=perm[1]-1;i++) 
-      magic_scale*=sizes[i];
-
-   
+  if(perm_specified) {
+     for (int i=perm[0]+1;i<=perm[1]-1;i++) 
+         magic_scale*=sizes[i];
+  }
   int nff, nf; // faster, fast
   int nff_niv, nf_niv; 
   // should revise when dim > 3
   // exchange (0,1) is different from (0,2) and (1,2) 
-  // always assign threadIdx.x to z direction, 
-  nff = sizes[dim-1];
-  nf = (perm[1]==dim-1)?sizes[perm[0]]:sizes[dim-2]; // if involving last dim, then the other dim; else the one next to the last dim
-  nff_niv = sizes[dim-1];
-  nf_niv = sizes[dim-2];
+  // always assign threadIdx.x to z direction,
+  if(perm_specified) { 
+      nff = sizes[dim-1];
+      nf = (perm[1]==dim-1)?sizes[perm[0]]:sizes[dim-2]; // if involving last dim, then the other dim; else the one next to the last dim
+      nff_niv = sizes[dim-1];
+      nf_niv = sizes[dim-2];
+  }
+  else if(shuf_specified) {
+      nff = sizes[dim-1];
+      nf = sizes[dim-2];
+  }
 
   dim3 dimGrid((nff-1)/TILE_DIM+1, (nf-1)/TILE_DIM+1, scale/(nff*nf));
   dim3 dimBlock(TILE_DIM, BLOCK_ROWS, 1);
@@ -502,7 +567,16 @@ int main(int argc, char **argv)
   cudaDeviceProp prop;
   checkCuda( cudaGetDeviceProperties(&prop, devId));
   printf("\nDevice : %s\n", prop.name);
-  printf("perm order: (%d, %d)\n", perm[0], perm[1]);
+  if(perm_specified){
+     printf("perm order: (%d, %d)\n", perm[0], perm[1]);
+  }
+  else if(shuf_specified){
+     printf("shuf order: (");
+     for (int j=0;j<dim;j++){
+        printf("%d,", shuf[j]);
+     }
+     printf(")\n");
+  }
   printf("Matrix size: ");
   for (int i =0; i<dim; i++)
       printf("%d ", sizes[i]);
@@ -524,10 +598,12 @@ int main(int argc, char **argv)
   //checkCuda( cudaMalloc(&d_idata, mem_size) );
   checkCuda( cudaMalloc(&d_cdata, mem_size) );
   checkCuda( cudaMalloc(&d_tdata, mem_size) );
-  int *d_sizes, *d_sizes_perm, *d_perm;
+  int *d_sizes, *d_sizes_perm, *d_perm, *d_sizes_shuf, *d_shuf;
   checkCuda( cudaMalloc(&d_sizes, dim*sizeof(int)) );
   checkCuda( cudaMalloc(&d_sizes_perm, dim*sizeof(int)) );
   checkCuda( cudaMalloc(&d_perm, 2*sizeof(int)) );
+  checkCuda( cudaMalloc(&d_sizes_shuf, dim*sizeof(int)) );
+  checkCuda( cudaMalloc(&d_shuf, dim*sizeof(int)) );
 
   // check parameters and calculate execution configuration
   /*
@@ -547,19 +623,35 @@ int main(int argc, char **argv)
       h_idata[i]=i;
 
   int sizes_perm[dim];
-  for (int i=0;i<dim;i++) sizes_perm[i]=sizes[i];
-  sizes_perm[perm[0]] = sizes[perm[1]];
-  sizes_perm[perm[1]] = sizes[perm[0]];
-
   int index[dim];
-  for (int i=0;i<scale;i++){ 
-      numidxToArridx(index, i, sizes_perm, dim, scale);
-      int t=index[perm[0]];
-      index[perm[0]]=index[perm[1]];
-      index[perm[1]]=t;
-      int ans_index;
-      arridxToNumidx(ans_index, index, sizes, dim, scale);
-      gold[i] = h_idata[ans_index];
+  int index_shuf[dim];
+  int sizes_shuf[dim];
+
+  if(perm_specified){
+      for (int i=0;i<dim;i++) sizes_perm[i]=sizes[i];
+      sizes_perm[perm[0]] = sizes[perm[1]];
+      sizes_perm[perm[1]] = sizes[perm[0]];
+      for (int i=0;i<scale;i++){ 
+          numidxToArridx(index, i, sizes_perm, dim, scale);
+          int t=index[perm[0]];
+          index[perm[0]]=index[perm[1]];
+          index[perm[1]]=t;
+          int ans_index;
+          arridxToNumidx(ans_index, index, sizes, dim, scale);
+          gold[i] = h_idata[ans_index];
+      }
+  }
+  else if(shuf_specified){
+      for (int i=0;i<dim;i++) sizes_shuf[i] = sizes[shuf[i]];
+      for (int i=0;i<scale;i++){ 
+          numidxToArridx(index, i, sizes, dim, scale);
+          for(int j=0;j<dim;j++){
+             index_shuf[j] = index[shuf[j]];
+          }
+          int ans_index;
+          arridxToNumidx(ans_index, index_shuf, sizes_shuf, dim, scale);
+          gold[ans_index] = h_idata[i];
+      }
   }
 
 
@@ -570,6 +662,8 @@ int main(int argc, char **argv)
   checkCuda( cudaMemcpy(d_perm, perm, 2*sizeof(int), cudaMemcpyHostToDevice) );
   checkCuda( cudaMemcpy(d_sizes, sizes, dim*sizeof(int), cudaMemcpyHostToDevice) );
   checkCuda( cudaMemcpy(d_sizes_perm, sizes_perm, dim*sizeof(int), cudaMemcpyHostToDevice) );
+  checkCuda( cudaMemcpy(d_shuf, shuf, dim*sizeof(int), cudaMemcpyHostToDevice) );
+  checkCuda( cudaMemcpy(d_sizes_shuf, sizes_shuf, dim*sizeof(int), cudaMemcpyHostToDevice) );
   
 
   // events for timing
@@ -619,19 +713,20 @@ int main(int argc, char **argv)
   // --------------
   // transposeNaive 
   // --------------
-  
-  printf("%25s", "naive transpose");
-  checkCuda( cudaMemset(d_tdata, 0, mem_size) );
-  // warmup
-  transposeNaive<<<dimGrid_niv, dimBlock_niv>>>(d_tdata, d_idata, d_sizes, d_sizes_perm, d_perm, dim, scale, magic_scale);
-  checkCuda( cudaEventRecord(startEvent, 0) );
-  for (int i = 0; i < NUM_REPS; i++)
-     transposeNaive<<<dimGrid_niv, dimBlock_niv>>>(d_tdata, d_idata, d_sizes, d_sizes_perm, d_perm, dim, scale, magic_scale);
-  checkCuda( cudaEventRecord(stopEvent, 0) );
-  checkCuda( cudaEventSynchronize(stopEvent) );
-  checkCuda( cudaEventElapsedTime(&ms, startEvent, stopEvent) );
-  checkCuda( cudaMemcpy(h_tdata, d_tdata, mem_size, cudaMemcpyDeviceToHost) );
-  postprocess(gold, h_tdata, scale, ms);
+  if(perm_specified) {
+      printf("%25s", "naive transpose");
+      checkCuda( cudaMemset(d_tdata, 0, mem_size) );
+      // warmup
+      transposeNaive<<<dimGrid_niv, dimBlock_niv>>>(d_tdata, d_idata, d_sizes, d_sizes_perm, d_perm, dim, scale, magic_scale);
+      checkCuda( cudaEventRecord(startEvent, 0) );
+      for (int i = 0; i < NUM_REPS; i++)
+          transposeNaive<<<dimGrid_niv, dimBlock_niv>>>(d_tdata, d_idata, d_sizes, d_sizes_perm, d_perm, dim, scale, magic_scale);
+      checkCuda( cudaEventRecord(stopEvent, 0) );
+      checkCuda( cudaEventSynchronize(stopEvent) );
+      checkCuda( cudaEventElapsedTime(&ms, startEvent, stopEvent) );
+      checkCuda( cudaMemcpy(h_tdata, d_tdata, mem_size, cudaMemcpyDeviceToHost) );
+      postprocess(gold, h_tdata, scale, ms);
+  }
 /*
   // ------------------
   // transposeCoalesced 
@@ -686,20 +781,35 @@ int main(int argc, char **argv)
   // transposeInplaceMultiDimension
   // ------------------------
   
-     printf("%25s", "In-place last dim");
-     checkCuda( cudaMemset(d_tdata, 0, mem_size) );
-     // warmup
-     transposeInplaceMultiDim<<<dimGrid, dimBlock>>>(d_tdata, d_idata, d_sizes, d_sizes_perm, d_perm, dim, scale, magic_scale);
-     checkCuda( cudaEventRecord(startEvent, 0) );
-     for (int i = 0; i < NUM_REPS; i++)
-        transposeInplaceMultiDim<<<dimGrid, dimBlock>>>(d_tdata, d_idata, d_sizes, d_sizes_perm, d_perm, dim, scale, magic_scale);
-     checkCuda( cudaEventRecord(stopEvent, 0) );
-     checkCuda( cudaEventSynchronize(stopEvent) );
-     checkCuda( cudaEventElapsedTime(&ms, startEvent, stopEvent) );
-     checkCuda( cudaMemcpy(h_tdata, d_tdata, mem_size, cudaMemcpyDeviceToHost) );
-     postprocess(gold, h_tdata, scale, ms);
+  if(perm_specified){
+      printf("%25s", "In-place last dim");
+      checkCuda( cudaMemset(d_tdata, 0, mem_size) );
+      // warmup
+      transposeInplaceMultiDim<<<dimGrid, dimBlock>>>(d_tdata, d_idata, d_sizes, d_sizes_perm, d_perm, dim, scale, magic_scale);
+      checkCuda( cudaEventRecord(startEvent, 0) );
+      for (int i = 0; i < NUM_REPS; i++)
+          transposeInplaceMultiDim<<<dimGrid, dimBlock>>>(d_tdata, d_idata, d_sizes, d_sizes_perm, d_perm, dim, scale, magic_scale);
+      checkCuda( cudaEventRecord(stopEvent, 0) );
+      checkCuda( cudaEventSynchronize(stopEvent) );
+      checkCuda( cudaEventElapsedTime(&ms, startEvent, stopEvent) );
+      checkCuda( cudaMemcpy(h_tdata, d_tdata, mem_size, cudaMemcpyDeviceToHost) );
+      postprocess(gold, h_tdata, scale, ms);
+  }
   
-  
+  if(shuf_specified){
+      printf("%25s", "shuffle");
+      checkCuda( cudaMemset(d_tdata, 0, mem_size) );
+      // warmup
+      shuffle<<<dimGrid, dimBlock>>>(d_tdata, d_idata, d_sizes, d_sizes_shuf, d_shuf, dim, scale);
+      checkCuda( cudaEventRecord(startEvent, 0) );
+      for (int i = 0; i < NUM_REPS; i++)
+          shuffle<<<dimGrid, dimBlock>>>(d_tdata, d_idata, d_sizes, d_sizes_shuf, d_shuf, dim, scale);
+      checkCuda( cudaEventRecord(stopEvent, 0) );
+      checkCuda( cudaEventSynchronize(stopEvent) );
+      checkCuda( cudaEventElapsedTime(&ms, startEvent, stopEvent) );
+      checkCuda( cudaMemcpy(h_tdata, d_tdata, mem_size, cudaMemcpyDeviceToHost) );
+      postprocess(gold, h_tdata, scale, ms);
+  }
   // cleanup
   checkCuda( cudaEventDestroy(startEvent) );
   checkCuda( cudaEventDestroy(stopEvent) );
