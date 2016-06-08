@@ -2,6 +2,12 @@ all:
 	nvcc transpose.cu -o transpose
 test:
 	./transpose -d 2 -s 96 32 -p 0 1
+	./transpose -d 4 -s 64 32 64 32 -p 0 1
+	./transpose -d 4 -s 64 32 64 32 -p 0 2
+	./transpose -d 4 -s 64 32 64 32 -p 0 3
+	./transpose -d 4 -s 64 32 64 32 -p 1 2
+	./transpose -d 4 -s 64 32 64 32 -p 1 3
+	./transpose -d 4 -s 64 32 64 32 -p 2 3
 	./transpose -d 3 -s 2 16 16 -p 0 1
 	./transpose -d 3 -s 2 16 16 -p 0 2
 	./transpose -d 3 -s 2 16 16 -p 1 2

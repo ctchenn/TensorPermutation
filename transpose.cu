@@ -299,19 +299,20 @@ __global__ void transposeInplaceMultiDim(float *odata, const float *idata, const
   int posl = blockIdx.z; 
   int postposff = blockIdx_y * TILE_DIM + idxff;
   int postposf = blockIdx_x * TILE_DIM + idxf;
-  int scale_remaining = scale/sizes[perm[0]]/sizes[perm[1]];
+  int scale_remaining;
 
   int arridx[10], arridx_out[10], arridx_2[10], sizes_2[10];    // assume maximum dimension=10
   int numidx, numidx_out;
    
-  int d=0;
-  for(int j=0;j<dim;j++)
-     if(j!=perm[0] && j!=perm[1])
-         sizes_2[d++] = sizes[j];
-  numidxToArridx(arridx_2, posl, sizes_2, dim-2, scale_remaining);
   
   if(perm[1]==dim-1) {
       // find the corresponding arridx of this thread
+      scale_remaining = scale/sizes[perm[0]]/sizes[perm[1]];
+      int d=0;
+      for(int j=0;j<dim;j++)
+         if(j!=perm[0] && j!=perm[1])
+             sizes_2[d++] = sizes[j];
+      numidxToArridx(arridx_2, posl, sizes_2, dim-2, scale_remaining);
       d=0;
       for(int j=0;j<dim;j++){
          if(j!=perm[0] && j!=dim-1)
@@ -355,6 +356,11 @@ __global__ void transposeInplaceMultiDim(float *odata, const float *idata, const
       }
   }
   else {
+      scale_remaining = scale/sizes[dim-1]/sizes[dim-2];
+      int d=0;
+      for(int j=0;j<dim-2;j++)
+          sizes_2[d++] = sizes[j];
+      numidxToArridx(arridx_2, posl, sizes_2, dim-2, scale_remaining);
       for(int j=0;j<dim-2;j++){  
 	     arridx[j] = arridx_out[j] = arridx_2[j];
       }
@@ -400,15 +406,14 @@ __global__ void transposeNaive(float *odata, const float *idata, const int* size
   int posff = blockIdx_x * TILE_DIM + idxff;
   int posf = blockIdx_y * TILE_DIM + idxf;
   int posl = blockIdx.z; 
-  int scale_remaining = scale/sizes[perm[0]]/sizes[perm[1]];
+  int scale_remaining = scale/sizes[dim-1]/sizes[dim-2];
 
   int arridx[10], arridx_out[10], arridx_2[10], sizes_2[10];    // assume maximum dimension=10
   int numidx, numidx_out;
 
   int d=0;
-  for(int j=0;j<dim;j++)
-     if(j!=perm[0] && j!=perm[1])
-         sizes_2[d++] = sizes[j];
+  for(int j=0;j<dim-2;j++)
+     sizes_2[d++] = sizes[j];
   numidxToArridx(arridx_2, posl, sizes_2, dim-2, scale_remaining);
   
   for(int j=0;j<dim-2;j++){  
@@ -663,6 +668,7 @@ int main(int argc, char **argv)
   // ------------------------
   // transposeInplace
   // ------------------------
+  /*
   printf("%25s", "In-place transpose");
   checkCuda( cudaMemset(d_tdata, 0, mem_size) );
   // warmup
@@ -675,7 +681,7 @@ int main(int argc, char **argv)
   checkCuda( cudaEventElapsedTime(&ms, startEvent, stopEvent) );
   checkCuda( cudaMemcpy(h_tdata, d_tdata, mem_size, cudaMemcpyDeviceToHost) );
   postprocess(gold, h_tdata, scale, ms);
-  
+  */
   // ------------------------
   // transposeInplaceMultiDimension
   // ------------------------
