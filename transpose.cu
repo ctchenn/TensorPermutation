@@ -51,25 +51,25 @@ void postprocess(const float *ref, const float *res, int n, float ms)
 {
   bool passed = true;
   
-  printf("\nreference:\n");
   
-  /*for (int i=0; i<16; i++) {
-      for (int j=0; j<16; j++) {
-          printf("(");
-          for (int k=0; k<2; k++)
-              printf("%3.0f ", ref[i*2*16 + j * 2 + k]);
-          printf(")");
+/*  printf("\nreference:\n");
+  for (int i=0; i<2; i++) {
+      for (int j=0; j<2; j++) {
+          printf("(i,j)=(%d,%d)\n", i,j);
+          for (int k=0; k<64; k++)
+              printf("%3.0f ", ref[i*2*64 + j * 64 + k]);
+          printf("\n");
       }
       printf("\n");
   }
   printf("\n");
   printf("\nresult:\n");
-  for (int i=0; i<16; i++) {
-      for (int j=0; j<16; j++) {
-          printf("(");
-          for (int k=0; k<2; k++)
-              printf("%3.0f ", res[i*16*2 + j * 2 + k]);
-          printf(")");
+  for (int i=0; i<2; i++) {
+      for (int j=0; j<2; j++) {
+          printf("(i,j)=(%d,%d)\n",i,j);
+          for (int k=0; k<64; k++)
+              printf("%3.0f ", res[i*2*64 + j * 64 + k]);
+          printf("\n");
       }
       printf("\n");
   }
@@ -122,43 +122,10 @@ __global__ void copySharedMem(float *odata, const float *idata, int nx, int ny)
      odata[(y+j)*nx + x] = tile[(threadIdx.y+j)*TILE_DIM + threadIdx.x];          
 }
 
-// naive transpose
-// Simplest transpose; doesn't use shared memory.
-// Global memory reads are coalesced but writes are not.
-/*
-__global__ void transposeNaive(float *odata, const float *idata, const int* sizes, const int* perm, const int dim)
-{
-  int posff = blockIdx.x * TILE_DIM + threadIdx.x;
-  int posf = blockIdx.y * TILE_DIM + threadIdx.y;
-  int posl = blockIdx.z * 1 + threadIdx.z;
-  int scale_remaining = scale/sizes[perm[0]]/sizes[perm[1]];
-
-  if (perm[1] == dim-1) {
-      for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS)
-          odata[] = idata[
-
-  if (perm[0] == 1 and perm[1] == 2)   // exchange j, k
-      if (pos0<nz && pos1<ny && pos2<nx)
-          for (int j = 0; j < TILE_DIM && pos1+j<ny; j += BLOCK_ROWS)
-              odata[pos2*nz*ny + pos0*ny + pos1+j] = 
-                  idata[pos2*ny*nz + (pos1+j)*nz + pos0];
-  if (perm[0] == 0 and perm[1] == 2)   // i, k. pos0:z, pos1:x, pos2:y
-      if (pos0<nz && pos1<nx && pos2<ny)
-          for (int j = 0; j < TILE_DIM && pos1+j<nx; j += BLOCK_ROWS)
-              odata[pos0*nx*ny + pos2*nx + (pos1+j)] = 
-                  idata[(pos1+j)*ny*nz + pos2*nz + pos0];
-  if (perm[0] == 0 and perm[1] == 1)   // i, j
-      if (pos0<nz && pos1<ny && pos2<nx)
-          for (int j = 0; j < TILE_DIM && pos1+j<ny; j += BLOCK_ROWS)
-              odata[(pos1+j)*nx*nz + pos2*nz + pos0] = 
-                  idata[pos2*ny*nz + (pos1+j)*nz + pos0];
-}
-*/
-
 // naive transpose for 3D
 // Simplest transpose; doesn't use shared memory.
 // Global memory reads are coalesced but writes are not.
-__global__ void transposeNaive(float *odata, const float *idata, const int* sizes, const int* perm, const int dim)
+__global__ void transposeNaive3D(float *odata, const float *idata, const int* sizes, const int* perm, const int dim)
 {
   int pos0 = blockIdx.x * TILE_DIM + threadIdx.x;
   int pos1 = blockIdx.y * TILE_DIM + threadIdx.y;
@@ -416,6 +383,58 @@ __global__ void transposeInplaceMultiDim(float *odata, const float *idata, const
   }
 }
 
+// naive transpose
+// Simplest transpose; doesn't use shared memory.
+// Global memory reads are coalesced but writes are not.
+
+__global__ void transposeNaive(float *odata, const float *idata, const int* sizes, const int* sizes_perm, const int* perm, const int dim, const int scale, const int magic_scale)
+{
+  int idxff = threadIdx.x;
+  int idxf = threadIdx.y;
+  
+  // diagonal reordering
+  int bid = blockIdx.x + gridDim.x*blockIdx.y;
+  int blockIdx_y = bid%gridDim.y;
+  int blockIdx_x = ((bid/gridDim.y)+blockIdx_y)%gridDim.x;
+
+  int posff = blockIdx_x * TILE_DIM + idxff;
+  int posf = blockIdx_y * TILE_DIM + idxf;
+  int posl = blockIdx.z; 
+  int scale_remaining = scale/sizes[perm[0]]/sizes[perm[1]];
+
+  int arridx[10], arridx_out[10], arridx_2[10], sizes_2[10];    // assume maximum dimension=10
+  int numidx, numidx_out;
+
+  int d=0;
+  for(int j=0;j<dim;j++)
+     if(j!=perm[0] && j!=perm[1])
+         sizes_2[d++] = sizes[j];
+  numidxToArridx(arridx_2, posl, sizes_2, dim-2, scale_remaining);
+  
+  for(int j=0;j<dim-2;j++){  
+      arridx[j] = arridx_out[j] = arridx_2[j];
+  }
+  arridx[dim-2] = arridx_out[dim-2] = posf;
+  arridx[dim-1] = arridx_out[dim-1] = posff;
+  arridx_out[perm[0]] = arridx[perm[1]];
+  arridx_out[perm[1]] = arridx[perm[0]];
+  numidx = posl*sizes[dim-2]*sizes[dim-1]+posf*sizes[dim-1]+posff;
+  arridxToNumidx(numidx_out, arridx_out, sizes_perm, dim, scale);
+  int numidx_incr = BLOCK_ROWS * sizes[dim-1];
+  int numidx_out_incr;
+  if (perm[1] == dim-1 && perm[0]==dim-2)  numidx_out_incr = BLOCK_ROWS;
+  else if (perm[1] == dim-1) numidx_out_incr = BLOCK_ROWS * sizes[perm[0]];
+  else if(perm[1] == dim-2) numidx_out_incr = BLOCK_ROWS * magic_scale*sizes[perm[0]]*sizes[dim-1];
+  else numidx_out_incr = BLOCK_ROWS * sizes[dim-1];
+  if(checkRange(arridx, sizes, dim)){
+      for(int j=0;j<TILE_DIM && posf+j<sizes[dim-2];j+=BLOCK_ROWS){
+          odata[numidx_out] = idata[numidx];
+          numidx += numidx_incr;
+          numidx_out += numidx_out_incr;
+      }
+  } 
+}
+
 int main(int argc, char **argv)
 {
   int dim=0;
@@ -458,15 +477,19 @@ int main(int argc, char **argv)
 
    
   int nff, nf; // faster, fast
-
+  int nff_niv, nf_niv; 
   // should revise when dim > 3
   // exchange (0,1) is different from (0,2) and (1,2) 
   // always assign threadIdx.x to z direction, 
   nff = sizes[dim-1];
   nf = (perm[1]==dim-1)?sizes[perm[0]]:sizes[dim-2]; // if involving last dim, then the other dim; else the one next to the last dim
+  nff_niv = sizes[dim-1];
+  nf_niv = sizes[dim-2];
 
   dim3 dimGrid((nff-1)/TILE_DIM+1, (nf-1)/TILE_DIM+1, scale/(nff*nf));
   dim3 dimBlock(TILE_DIM, BLOCK_ROWS, 1);
+  dim3 dimGrid_niv((nff_niv-1)/TILE_DIM+1, (nf_niv-1)/TILE_DIM+1, scale/(nff_niv*nf_niv));
+  dim3 dimBlock_niv(TILE_DIM, BLOCK_ROWS, 1);
 
   int devId = 2;
   // if (argc > 1) devId = atoi(argv[1]);
@@ -595,10 +618,10 @@ int main(int argc, char **argv)
   printf("%25s", "naive transpose");
   checkCuda( cudaMemset(d_tdata, 0, mem_size) );
   // warmup
-  transposeNaive<<<dimGrid, dimBlock>>>(d_tdata, d_idata, d_sizes, d_perm, dim);
+  transposeNaive<<<dimGrid_niv, dimBlock_niv>>>(d_tdata, d_idata, d_sizes, d_sizes_perm, d_perm, dim, scale, magic_scale);
   checkCuda( cudaEventRecord(startEvent, 0) );
   for (int i = 0; i < NUM_REPS; i++)
-     transposeNaive<<<dimGrid, dimBlock>>>(d_tdata, d_idata, d_sizes, d_perm, dim);
+     transposeNaive<<<dimGrid_niv, dimBlock_niv>>>(d_tdata, d_idata, d_sizes, d_sizes_perm, d_perm, dim, scale, magic_scale);
   checkCuda( cudaEventRecord(stopEvent, 0) );
   checkCuda( cudaEventSynchronize(stopEvent) );
   checkCuda( cudaEventElapsedTime(&ms, startEvent, stopEvent) );
