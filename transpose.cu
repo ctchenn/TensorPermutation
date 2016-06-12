@@ -714,7 +714,7 @@ int main(int argc, char **argv)
   // transposeNaive 
   // --------------
   if(perm_specified) {
-      printf("%25s", "naive transpose");
+      printf("%25s", "transpose naive");
       checkCuda( cudaMemset(d_tdata, 0, mem_size) );
       // warmup
       transposeNaive<<<dimGrid_niv, dimBlock_niv>>>(d_tdata, d_idata, d_sizes, d_sizes_perm, d_perm, dim, scale, magic_scale);
@@ -782,7 +782,7 @@ int main(int argc, char **argv)
   // ------------------------
   
   if(perm_specified){
-      printf("%25s", "In-place last dim");
+      printf("%25s", "transpose heuristic");
       checkCuda( cudaMemset(d_tdata, 0, mem_size) );
       // warmup
       transposeInplaceMultiDim<<<dimGrid, dimBlock>>>(d_tdata, d_idata, d_sizes, d_sizes_perm, d_perm, dim, scale, magic_scale);
@@ -797,7 +797,7 @@ int main(int argc, char **argv)
   }
   
   if(shuf_specified){
-      printf("%25s", "shuffle");
+      printf("%25s", "shuffle naive");
       checkCuda( cudaMemset(d_tdata, 0, mem_size) );
       // warmup
       shuffle<<<dimGrid, dimBlock>>>(d_tdata, d_idata, d_sizes, d_sizes_shuf, d_shuf, dim, scale);
@@ -809,6 +809,92 @@ int main(int argc, char **argv)
       checkCuda( cudaEventElapsedTime(&ms, startEvent, stopEvent) );
       checkCuda( cudaMemcpy(h_tdata, d_tdata, mem_size, cudaMemcpyDeviceToHost) );
       postprocess(gold, h_tdata, scale, ms);
+
+
+      // shuffle heuristic 
+      // check if two stages are needed
+      int involve_last = 0;
+      int dest_last;
+      if(shuf[dim-1]==dim-1){
+	 involve_last=0;
+         dest_last=dim-1;
+      }
+      else {
+         involve_last=1;
+	 dest_last = shuf[dim-1];
+      }
+      if(involve_last){
+	      printf("%25s", "shuffle heuristic (1)");
+	      int sizes_stage_1[10];
+	      for(int j=0;j<dim;j++)  sizes_stage_1[j] = sizes[j];
+	      sizes_stage_1[dest_last] = sizes[dim-1];
+	      sizes_stage_1[dim-1] = sizes[dest_last];
+	      perm[0] = dest_last;
+	      perm[1] = dim-1;
+	      
+	      /*TODO: recalculate magic scale, dimGrid, dimBlock    */
+	      nff = sizes[dim-1];
+	      nf = sizes[dest_last];
+	      dimGrid.x = (nff-1)/TILE_DIM+1; 
+	      dimGrid.y = (nf-1)/TILE_DIM+1; 
+	      dimGrid.z = scale/(nff*nf);
+	      magic_scale=1;
+	      for(int i=dest_last+1;i<dim-1;i++)
+		      magic_scale *= sizes[i];
+	      /*TODO: recopy d_sizes_perm, d_perm*/
+	      checkCuda( cudaMemcpy(d_sizes_perm, sizes_stage_1, dim*sizeof(int), cudaMemcpyHostToDevice));
+	      checkCuda( cudaMemcpy(d_perm, perm, 2*sizeof(int), cudaMemcpyHostToDevice));
+
+	      checkCuda( cudaMemset(d_tdata, 0, mem_size) );
+	      // warmup
+	      transposeInplaceMultiDim<<<dimGrid, dimBlock>>>(d_tdata, d_idata, d_sizes, d_sizes_perm, d_perm, dim, scale, magic_scale);
+	      checkCuda( cudaEventRecord(startEvent, 0) );
+	      for (int i = 0; i < NUM_REPS; i++)
+		      transposeInplaceMultiDim<<<dimGrid, dimBlock>>>(d_tdata, d_idata, d_sizes, d_sizes_perm, d_perm, dim, scale, magic_scale);
+	      checkCuda( cudaEventRecord(stopEvent, 0) );
+	      checkCuda( cudaEventSynchronize(stopEvent) );
+	      checkCuda( cudaEventElapsedTime(&ms, startEvent, stopEvent) );
+	      //checkCuda( cudaMemcpy(h_tdata, d_tdata, mem_size, cudaMemcpyDeviceToHost) );
+	      //postprocess(gold, h_tdata, scale, ms);
+   	      printf("%20.2f\n", 2 * scale * sizeof(float) * 1e-6 * NUM_REPS / ms );
+              float stage_1_ms = ms;
+
+              /*TODO: recalculate dimGrid, dimBlock, size_shuf, shuf*/ 
+	      nff = sizes[dim-1];
+	      nf = sizes[dim-2];
+	      dimGrid.x = (nff-1)/TILE_DIM+1; 
+	      dimGrid.y = (nf-1)/TILE_DIM+1; 
+	      dimGrid.z = scale/(nff*nf);
+	      for(int i=0;i<dim;i++){
+	         if(shuf[i]==dim-1)
+	            shuf[i]=shuf[dim-1];
+	      } 
+	      shuf[dim-1]=dim-1;
+	      checkCuda( cudaMemcpy(d_shuf, shuf, dim*sizeof(int), cudaMemcpyHostToDevice));
+	      checkCuda( cudaMemcpy(d_sizes, sizes_stage_1, dim*sizeof(int), cudaMemcpyHostToDevice));
+	       
+
+	      /*TODO: recopy d_sizes, d_sizes_shuf*/
+	      printf("%25s", "shuffle heuristic (2)");
+	      checkCuda( cudaMemcpy(d_idata, d_tdata, mem_size, cudaMemcpyDeviceToDevice) );
+	      checkCuda( cudaMemset(d_tdata, 0, mem_size) );
+	      // warmup
+	      shuffle<<<dimGrid, dimBlock>>>(d_tdata, d_idata, d_sizes, d_sizes_shuf, d_shuf, dim, scale);
+	      checkCuda( cudaEventRecord(startEvent, 0) );
+	      for (int i = 0; i < NUM_REPS; i++)
+		      shuffle<<<dimGrid, dimBlock>>>(d_tdata, d_idata, d_sizes, d_sizes_shuf, d_shuf, dim, scale);
+	      checkCuda( cudaEventRecord(stopEvent, 0) );
+	      checkCuda( cudaEventSynchronize(stopEvent) );
+	      checkCuda( cudaEventElapsedTime(&ms, startEvent, stopEvent) );
+	      checkCuda( cudaMemcpy(h_tdata, d_tdata, mem_size, cudaMemcpyDeviceToHost) );
+	      postprocess(gold, h_tdata, scale, ms);
+	      printf("%25s", "shuffle heuristic (tot)");
+   	      printf("%20.2f\n", 2 * scale * sizeof(float) * 1e-6 * NUM_REPS / (ms+stage_1_ms) );
+      }
+      else{
+	      printf("%25s", "shuffle heuristic");
+              printf("%20s", "naive is used\n"); 
+      }
   }
   // cleanup
   checkCuda( cudaEventDestroy(startEvent) );
