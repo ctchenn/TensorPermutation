@@ -870,22 +870,31 @@ int main(int argc, char **argv)
 	            shuf[i]=shuf[dim-1];
 	      } 
 	      shuf[dim-1]=dim-1;
-	      checkCuda( cudaMemcpy(d_shuf, shuf, dim*sizeof(int), cudaMemcpyHostToDevice));
-	      checkCuda( cudaMemcpy(d_sizes, sizes_stage_1, dim*sizeof(int), cudaMemcpyHostToDevice));
-	       
+	      int can_break=1;
+	      for(int j=0;j<dim;j++){
+	         if(shuf[j]!=j) can_break=0;
+	      }
+              printf("%25s", "shuffle heuristic (2)");
+	      if(!can_break) {
+		      checkCuda( cudaMemcpy(d_shuf, shuf, dim*sizeof(int), cudaMemcpyHostToDevice));
+		      checkCuda( cudaMemcpy(d_sizes, sizes_stage_1, dim*sizeof(int), cudaMemcpyHostToDevice));
 
-	      /*TODO: recopy d_sizes, d_sizes_shuf*/
-	      printf("%25s", "shuffle heuristic (2)");
-	      checkCuda( cudaMemcpy(d_idata, d_tdata, mem_size, cudaMemcpyDeviceToDevice) );
-	      checkCuda( cudaMemset(d_tdata, 0, mem_size) );
-	      // warmup
-	      shuffle<<<dimGrid, dimBlock>>>(d_tdata, d_idata, d_sizes, d_sizes_shuf, d_shuf, dim, scale);
-	      checkCuda( cudaEventRecord(startEvent, 0) );
-	      for (int i = 0; i < NUM_REPS; i++)
+
+		      /*TODO: recopy d_sizes, d_sizes_shuf*/
+		      checkCuda( cudaMemcpy(d_idata, d_tdata, mem_size, cudaMemcpyDeviceToDevice) );
+		      checkCuda( cudaMemset(d_tdata, 0, mem_size) );
+		      // warmup
 		      shuffle<<<dimGrid, dimBlock>>>(d_tdata, d_idata, d_sizes, d_sizes_shuf, d_shuf, dim, scale);
-	      checkCuda( cudaEventRecord(stopEvent, 0) );
-	      checkCuda( cudaEventSynchronize(stopEvent) );
-	      checkCuda( cudaEventElapsedTime(&ms, startEvent, stopEvent) );
+		      checkCuda( cudaEventRecord(startEvent, 0) );
+		      for (int i = 0; i < NUM_REPS; i++)
+			      shuffle<<<dimGrid, dimBlock>>>(d_tdata, d_idata, d_sizes, d_sizes_shuf, d_shuf, dim, scale);
+		      checkCuda( cudaEventRecord(stopEvent, 0) );
+		      checkCuda( cudaEventSynchronize(stopEvent) );
+		      checkCuda( cudaEventElapsedTime(&ms, startEvent, stopEvent) );
+	      }
+	      else {
+	         ms=0;
+	      }
 	      checkCuda( cudaMemcpy(h_tdata, d_tdata, mem_size, cudaMemcpyDeviceToHost) );
 	      postprocess(gold, h_tdata, scale, ms);
 	      printf("%25s", "shuffle heuristic (tot)");
